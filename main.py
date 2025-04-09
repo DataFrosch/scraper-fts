@@ -1,10 +1,11 @@
 import requests
-import pandas as pd
 import os
 import tempfile
 import psycopg2
+import openpyxl
 from dotenv import load_dotenv
 from datetime import datetime
+from psycopg2.extras import execute_values
 
 
 def create_table(conn):
@@ -17,21 +18,21 @@ def create_table(conn):
     CREATE TABLE IF NOT EXISTS fts_data (
         id SERIAL PRIMARY KEY,
         year INTEGER,
-        budget VARCHAR(255),
-        reference_legal_commitment VARCHAR(255),
-        reference_budget VARCHAR(255),
-        beneficiary_name VARCHAR(255),
-        beneficiary_vat VARCHAR(255),
+        budget TEXT,
+        reference_legal_commitment TEXT,
+        reference_budget TEXT,
+        beneficiary_name TEXT,
+        beneficiary_vat TEXT,
         not_for_profit BOOLEAN,
         non_governmental BOOLEAN,
         coordinator BOOLEAN,
-        address VARCHAR(255),
-        city VARCHAR(255),
-        postal_code VARCHAR(50),
-        beneficiary_country VARCHAR(100),
-        nuts2 VARCHAR(100),
-        geographical_zone VARCHAR(255),
-        action_location VARCHAR(255),
+        address TEXT,
+        city TEXT,
+        postal_code TEXT,
+        beneficiary_country TEXT,
+        nuts2 TEXT,
+        geographical_zone TEXT,
+        action_location TEXT,
         beneficiary_contracted_amount NUMERIC,
         beneficiary_estimated_contracted_amount NUMERIC,
         beneficiary_estimated_consumed_amount NUMERIC,
@@ -39,78 +40,66 @@ def create_table(conn):
         additional_reduced_amount NUMERIC,
         commitment_total_amount NUMERIC,
         commitment_consumed_amount NUMERIC,
-        source_estimated_detailed_amount VARCHAR(255),
-        expense_type VARCHAR(100),
+        source_estimated_detailed_amount TEXT,
+        expense_type TEXT,
         subject_grant_contract TEXT,
-        responsible_department VARCHAR(255),
-        budget_line_number VARCHAR(100),
-        budget_line_name VARCHAR(255),
-        programme_name VARCHAR(255),
-        funding_type VARCHAR(100),
-        beneficiary_group_code VARCHAR(50),
-        beneficiary_type VARCHAR(100),
+        responsible_department TEXT,
+        budget_line_number TEXT,
+        budget_line_name TEXT,
+        programme_name TEXT,
+        funding_type TEXT,
+        beneficiary_group_code TEXT,
+        beneficiary_type TEXT,
         project_start_date DATE,
         project_end_date DATE,
-        type_of_contract VARCHAR(100),
-        management_type VARCHAR(100),
-        benefiting_country VARCHAR(100)
+        type_of_contract TEXT,
+        management_type TEXT,
+        benefiting_country TEXT
     )
     """
     )
+
     conn.commit()
 
 
-def clean_data(df):
-    """Clean and normalize the data"""
-    # Replace missing values with None
-    df = df.where(pd.notna(df), None)
+def clean_value(value, column_type=None):
+    """Clean and normalize a single value"""
+    if value is None or value == "":
+        return None
 
     # Convert Yes/No to boolean
-    for col in [
-        "Not-for-profit organisation (NFPO)",
-        "Non-governmental organisation (NGO)",
-        "Coordinator",
-    ]:
-        if col in df.columns:
-            df[col] = df[col].map({"Yes": True, "No": False})
+    if column_type == "boolean":
+        if value == "Yes":
+            return True
+        elif value == "No":
+            return False
+        return None
 
-    # Convert date columns to proper format
-    for col in ["Project start date", "Project end date"]:
-        if col in df.columns:
-            # Convert to datetime but handle NaT values before database insertion
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-            # Convert NaT to None for database compatibility
-            df[col] = df[col].where(pd.notna(df[col]), None)
+    # Convert date values
+    if column_type == "date":
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d")
+        elif value == "-" or not value:
+            return None
 
-    # Convert numeric columns to float
-    numeric_cols = [
-        "Beneficiary’s contracted amount (EUR)",
-        "Beneficiary’s estimated contracted amount (EUR)",
-        "Beneficiary’s estimated consumed amount (EUR)",
-        "Commitment contracted amount (EUR) (A)",
-        "Additional/Reduced amount (EUR) (B)",
-        "Commitment  total amount (EUR) (A+B)",
-        "Commitment consumed amount (EUR)",
-    ]
+    # Convert numeric values
+    if column_type == "numeric":
+        if isinstance(value, (int, float)):
+            return value
+        elif isinstance(value, str):
+            try:
+                return float(value.replace(",", ""))
+            except (ValueError, AttributeError):
+                return None
+        return None
 
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col].astype(str).str.replace(",", ""), errors="coerce"
-            )
-
-    return df
+    # Return the value as-is for other types
+    return value
 
 
-def insert_data(conn, df, year):
-    """Insert data into the database"""
-    cursor = conn.cursor()
-
-    # Clean data before insertion
-    df = clean_data(df)
-
-    # Map DataFrame columns to database columns
-    column_mapping = {
+def get_column_mapping():
+    """Get mapping between Excel columns and database columns"""
+    return {
         "Year": "year",
         "Budget": "budget",
         "Reference of the Legal Commitment (LC)": "reference_legal_commitment",
@@ -127,9 +116,9 @@ def insert_data(conn, df, year):
         "NUTS2": "nuts2",
         "Geographical Zone": "geographical_zone",
         "Action location": "action_location",
-        "Beneficiary’s contracted amount (EUR)": "beneficiary_contracted_amount",
-        "Beneficiary’s estimated contracted amount (EUR)": "beneficiary_estimated_contracted_amount",
-        "Beneficiary’s estimated consumed amount (EUR)": "beneficiary_estimated_consumed_amount",
+        "Beneficiary's contracted amount (EUR)": "beneficiary_contracted_amount",
+        "Beneficiary's estimated contracted amount (EUR)": "beneficiary_estimated_contracted_amount",
+        "Beneficiary's estimated consumed amount (EUR)": "beneficiary_estimated_consumed_amount",
         "Commitment contracted amount (EUR) (A)": "commitment_contracted_amount",
         "Additional/Reduced amount (EUR) (B)": "additional_reduced_amount",
         "Commitment  total amount (EUR) (A+B)": "commitment_total_amount",
@@ -151,45 +140,119 @@ def insert_data(conn, df, year):
         "Benefiting country": "benefiting_country",
     }
 
-    # Create a list of columns that exist in both the DataFrame and database
-    df_columns = df.columns.tolist()
-    db_columns = []
-    placeholders = []
 
-    for excel_col, db_col in column_mapping.items():
-        if excel_col in df_columns:
-            db_columns.append(db_col)
-            placeholders.append("%s")
+def get_column_types():
+    """Get column types for data cleaning"""
+    return {
+        "Not-for-profit organisation (NFPO)": "boolean",
+        "Non-governmental organisation (NGO)": "boolean",
+        "Coordinator": "boolean",
+        "Project start date": "date",
+        "Project end date": "date",
+        "Beneficiary's contracted amount (EUR)": "numeric",
+        "Beneficiary's estimated contracted amount (EUR)": "numeric",
+        "Beneficiary's estimated consumed amount (EUR)": "numeric",
+        "Commitment contracted amount (EUR) (A)": "numeric",
+        "Additional/Reduced amount (EUR) (B)": "numeric",
+        "Commitment  total amount (EUR) (A+B)": "numeric",
+        "Commitment consumed amount (EUR)": "numeric",
+    }
+
+
+def process_excel_data(file_path, year):
+    """Process Excel data using openpyxl for better performance"""
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    ws = wb.active
+
+    # Get column headers from first row
+    headers = []
+    for cell in next(ws.iter_rows()):
+        headers.append(cell.value)
+
+    print(f"Columns for year {year}:")
+    print(headers)
+
+    # Get column mapping and types
+    column_mapping = get_column_mapping()
+    column_types = get_column_types()
+
+    # Determine which columns exist in both Excel and database
+    excel_to_db_columns = {}
+    db_columns = []
+
+    for idx, header in enumerate(headers):
+        if header in column_mapping:
+            excel_to_db_columns[idx] = column_mapping[header]
+            db_columns.append(column_mapping[header])
+
+    # Prepare column types for processing
+    excel_column_types = {}
+    for idx, header in enumerate(headers):
+        if header in column_types:
+            excel_column_types[idx] = column_types[header]
+
+    # Process data rows
+    rows = []
+    batch_size = 5000  # Larger batch size for better performance
+    row_count = 0
+
+    # Skip header row
+    first_row = True
+
+    for row in ws.iter_rows():
+        if first_row:
+            first_row = False
+            continue
+
+        row_values = []
+        for idx, db_col in excel_to_db_columns.items():
+            value = row[idx].value
+            column_type = excel_column_types.get(idx)
+            cleaned_value = clean_value(value, column_type)
+            row_values.append(cleaned_value)
+
+        rows.append(tuple(row_values))
+        row_count += 1
+
+        # When batch size is reached, yield the batch
+        if len(rows) >= batch_size:
+            yield db_columns, rows
+            rows = []
+
+    # Yield any remaining rows
+    if rows:
+        yield db_columns, rows
+
+    wb.close()
+
+
+def insert_data_batch(conn, db_columns, rows):
+    """Insert data into the database using faster execute_values method"""
+    cursor = conn.cursor()
 
     # Build the INSERT query
     columns_str = ", ".join(db_columns)
-    placeholders_str = ", ".join(placeholders)
-    query = f"INSERT INTO fts_data ({columns_str}) VALUES ({placeholders_str})"
 
-    # Convert DataFrame to list of tuples for insertion
-    rows = []
-    for _, row in df.iterrows():
-        row_values = []
-        for excel_col, db_col in column_mapping.items():
-            if excel_col in df_columns:
-                # Handle date columns explicitly
-                if excel_col in ["Project start date", "Project end date"]:
-                    # Ensure NaT values are converted to None
-                    value = None if pd.isna(row[excel_col]) else row[excel_col]
-                else:
-                    value = row[excel_col]
-                row_values.append(value)
-        rows.append(tuple(row_values))
+    # Use execute_values which handles the placeholders internally
+    query = f"INSERT INTO fts_data ({columns_str}) VALUES %s"
 
-    # Insert records in batches to improve performance
-    batch_size = 1000
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i : i + batch_size]
-        cursor.executemany(query, batch)
-        conn.commit()
-        print(
-            f"Inserted {len(batch)} records for year {year} (batch {i//batch_size + 1}/{(len(rows)-1)//batch_size + 1})"
-        )
+    # Use the faster psycopg2.extras.execute_values method
+    execute_values(cursor, query, rows, page_size=1000)
+    conn.commit()
+
+
+def insert_data(conn, file_path, year):
+    """Process and insert Excel data into database"""
+    total_rows = 0
+    batch_count = 0
+
+    for db_columns, rows in process_excel_data(file_path, year):
+        batch_count += 1
+        total_rows += len(rows)
+        insert_data_batch(conn, db_columns, rows)
+        print(f"Inserted {len(rows)} records for year {year} (batch {batch_count})")
+
+    print(f"Total {total_rows} records inserted for year {year}")
 
 
 def connect_to_database():
@@ -256,15 +319,8 @@ def main():
                         with open(temp_file_path, "wb") as f:
                             f.write(response.content)
 
-                        # Read Excel file from disk
-                        df = pd.read_excel(temp_file_path)
-
-                        # Print the column headers
-                        print(f"Columns for year {year}:")
-                        print(df.columns.tolist())
-
-                        # Insert data into PostgreSQL
-                        insert_data(conn, df, year)
+                        # Process and insert data using the refactored approach
+                        insert_data(conn, temp_file_path, year)
 
                         print(f"Successfully processed data for year {year}")
                         print("-" * 50)
