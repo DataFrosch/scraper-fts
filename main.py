@@ -266,7 +266,7 @@ def connect_to_database():
     db_password = os.getenv("DB_PASSWORD")
 
     if not all([db_name, db_user, db_password]):
-        raise ValueError("Database credentials missing from .env file")
+        raise ValueError("Database credentials missing")
 
     conn = psycopg2.connect(
         host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password
